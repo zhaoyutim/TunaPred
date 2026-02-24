@@ -1,0 +1,10 @@
+species_name,event_date,species_id,grid_lat,grid_lon,month,day,sst,wind_speed,pressure,precipitation,activity_count
+Thunnus albacares,2025-06-01,0.0,0.0,100.0,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,0.0,100.5,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,0.0,101.0,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,0.5,100.0,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,0.5,100.5,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,0.5,101.0,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,1.0,100.0,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,1.0,100.5,6,1,26.2,12.0,1010.0,0.4,2.0
+Thunnus albacares,2025-06-01,0.0,1.0,101.0,6,1,26.2,12.0,1010.0,0.4,2.0
