@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -18,6 +19,7 @@ SPECIES = {
 }
 
 GBIF_URL = "https://api.gbif.org/v1/occurrence/search"
+OBIS_URL = "https://api.obis.org/v3/occurrence"
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 NOAA_GFS_POINT_URL = "https://api.open-meteo.com/v1/forecast"
 HYCOM_PLACEHOLDER_URL = "https://ncss.hycom.org/thredds/ncss/GLBy0.08/expt_93.0"
@@ -26,6 +28,12 @@ DATA_DIR = Path("data")
 RAW_PATH = DATA_DIR / "tuna_occurrences_2023.csv"
 FEATURE_PATH = DATA_DIR / "tuna_features_2023.csv"
 PREDICTION_CACHE_DIR = DATA_DIR / "predictions"
+FEATURE_DATASET_PATTERN = "tuna_features_*.csv"
+RAW_DATASET_PATTERN = "tuna_occurrences_*.csv"
+REALTIME_LOOKBACK_DAYS = 60
+HISTORICAL_YEARS = 3
+CMEMS_DATASET_ID = os.getenv("CMEMS_DATASET_ID", "cmems_mod_glo_phy_anfc_0.083deg_P1D-m")
+CMEMS_VARS = ["thetao", "so", "uo", "vo", "zos"]
 
 CHINA_SEAS_BBOX = {
     "lat_min": 5.0,
@@ -169,19 +177,134 @@ def _fetch_gbif_species_month(scientific_name: str, month: int, year: int = TRAI
     return pd.DataFrame(rows)
 
 
+def _recent_years(total_years: int = HISTORICAL_YEARS) -> List[int]:
+    current_year = dt.date.today().year
+    base_years = {TRAIN_YEAR, current_year}
+    for shift in range(max(total_years - 1, 0)):
+        base_years.add(current_year - shift)
+    return sorted(base_years)
+
+
+def _fetch_gbif_species_recent(scientific_name: str, start_date: dt.date, end_date: dt.date, max_rows: int = 300) -> pd.DataFrame:
+    rows: List[Dict] = []
+    limit = 100
+    offset = 0
+    while offset < max_rows:
+        params = {
+            "scientificName": scientific_name,
+            "hasCoordinate": "true",
+            "eventDate": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "limit": limit,
+            "offset": offset,
+        }
+        resp = requests.get(GBIF_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results", [])
+        if not results:
+            break
+        for item in results:
+            if "decimalLatitude" not in item or "decimalLongitude" not in item:
+                continue
+            event_date = item.get("eventDate")
+            if not event_date:
+                continue
+            rows.append(
+                {
+                    "species_name": scientific_name,
+                    "lat": float(item["decimalLatitude"]),
+                    "lon": float(item["decimalLongitude"]),
+                    "event_date": event_date[:10],
+                    "basis_of_record": item.get("basisOfRecord", "GBIF_RECENT"),
+                }
+            )
+        offset += limit
+    return pd.DataFrame(rows)
+
+
+def _fetch_obis_species_recent(scientific_name: str, start_date: dt.date, end_date: dt.date, max_rows: int = 300) -> pd.DataFrame:
+    rows: List[Dict] = []
+    size = 100
+    start = 0
+    while start < max_rows:
+        params = {
+            "scientificname": scientific_name,
+            "startdate": start_date.isoformat(),
+            "enddate": end_date.isoformat(),
+            "size": size,
+            "from": start,
+            "hascoords": "true",
+        }
+        resp = requests.get(OBIS_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results", [])
+        if not results:
+            break
+        for item in results:
+            lat = item.get("decimalLatitude")
+            lon = item.get("decimalLongitude")
+            event_date = item.get("eventDate") or item.get("date_mid")
+            if lat is None or lon is None or not event_date:
+                continue
+            rows.append(
+                {
+                    "species_name": scientific_name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "event_date": str(event_date)[:10],
+                    "basis_of_record": item.get("basisOfRecord") or "OBIS_OCCURRENCE",
+                }
+            )
+        start += size
+    return pd.DataFrame(rows)
+
+
+def _collect_near_realtime_occurrences(lookback_days: int = REALTIME_LOOKBACK_DAYS) -> pd.DataFrame:
+    end_date = dt.date.today()
+    start_date = end_date - dt.timedelta(days=lookback_days)
+    frames: List[pd.DataFrame] = []
+    for sci_name in SPECIES.values():
+        try:
+            gbif_recent = _fetch_gbif_species_recent(sci_name, start_date=start_date, end_date=end_date)
+        except Exception:
+            gbif_recent = pd.DataFrame()
+        if not gbif_recent.empty:
+            frames.append(gbif_recent)
+
+        try:
+            obis_recent = _fetch_obis_species_recent(sci_name, start_date=start_date, end_date=end_date)
+        except Exception:
+            obis_recent = pd.DataFrame()
+        if not obis_recent.empty:
+            frames.append(obis_recent)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def fetch_occurrences() -> pd.DataFrame:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     all_frames: List[pd.DataFrame] = []
-    for _, sci_name in SPECIES.items():
-        for month in range(1, 13):
-            frame = _fetch_gbif_species_month(sci_name, month)
-            if not frame.empty:
-                all_frames.append(frame)
+    for sci_name in SPECIES.values():
+        for year in _recent_years():
+            for month in range(1, 13):
+                frame = _fetch_gbif_species_month(sci_name, month, year=year)
+                if not frame.empty:
+                    all_frames.append(frame)
+
+    recent = _collect_near_realtime_occurrences()
+    if not recent.empty:
+        all_frames.append(recent)
+
     if not all_frames:
-        raise RuntimeError("No tuna occurrence data fetched from GBIF.")
+        raise RuntimeError("No tuna occurrence data fetched from internet sources.")
+
     out = pd.concat(all_frames, ignore_index=True)
     out["event_date"] = pd.to_datetime(out["event_date"], errors="coerce")
-    out = out.dropna(subset=["event_date"]).copy()
+    out = out.dropna(subset=["event_date", "lat", "lon", "species_name"]).copy()
+    out = out.drop_duplicates(subset=["species_name", "lat", "lon", "event_date", "basis_of_record"], keep="first")
     out.to_csv(RAW_PATH, index=False)
     return out
 
@@ -255,12 +378,71 @@ def _fetch_weather_row(lat: float, lon: float, day: dt.date) -> Dict:
     }
 
 
+
+
+def _fetch_cmems_row(lat: float, lon: float, day: dt.date) -> Dict:
+    default = {
+        "cmems_thetao": np.nan,
+        "cmems_so": np.nan,
+        "cmems_uo": np.nan,
+        "cmems_vo": np.nan,
+        "cmems_zos": np.nan,
+        "cmems_current_speed": np.nan,
+        "ok": False,
+        "detail": "unavailable",
+    }
+    try:
+        cm = __import__("copernicusmarine")
+    except Exception:
+        return default
+
+    try:
+        ds = cm.open_dataset(
+            dataset_id=CMEMS_DATASET_ID,
+            variables=CMEMS_VARS,
+            minimum_longitude=float(lon),
+            maximum_longitude=float(lon),
+            minimum_latitude=float(lat),
+            maximum_latitude=float(lat),
+            start_datetime=f"{day.isoformat()}T00:00:00",
+            end_datetime=f"{day.isoformat()}T23:59:59",
+        )
+    except Exception as exc:
+        default["detail"] = type(exc).__name__
+        return default
+
+    try:
+        thetao = float(ds["thetao"].mean().values) if "thetao" in ds else np.nan
+        so = float(ds["so"].mean().values) if "so" in ds else np.nan
+        uo = float(ds["uo"].mean().values) if "uo" in ds else np.nan
+        vo = float(ds["vo"].mean().values) if "vo" in ds else np.nan
+        zos = float(ds["zos"].mean().values) if "zos" in ds else np.nan
+        speed = float(math.sqrt((uo if not _is_missing(uo) else 0.0) ** 2 + (vo if not _is_missing(vo) else 0.0) ** 2)) if (not _is_missing(uo) or not _is_missing(vo)) else np.nan
+    except Exception as exc:
+        default["detail"] = f"parse_{type(exc).__name__}"
+        return default
+
+    return {
+        "cmems_thetao": thetao,
+        "cmems_so": so,
+        "cmems_uo": uo,
+        "cmems_vo": vo,
+        "cmems_zos": zos,
+        "cmems_current_speed": speed,
+        "ok": True,
+        "detail": "",
+    }
+
 def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
     cache_key = (round(lat, 4), round(lon, 4), day.isoformat())
     if cache_key in _FORCING_CACHE:
         return _FORCING_CACHE[cache_key]
 
-    # NOAA/HYCOM are primary targets; if unavailable, fallback to existing Open-Meteo path.
+    # CMEMS + NOAA/HYCOM are primary targets; fallback to existing Open-Meteo path.
+    try:
+        cmems = _fetch_cmems_row(lat, lon, day)
+    except Exception:
+        cmems = {"cmems_thetao": np.nan, "cmems_so": np.nan, "cmems_uo": np.nan, "cmems_vo": np.nan, "cmems_zos": np.nan, "cmems_current_speed": np.nan, "ok": False, "detail": "exception"}
     try:
         noaa = _fetch_noaa_row(lat, lon, day, timeout=4)
     except Exception:
@@ -271,7 +453,8 @@ def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
         hycom = _normalize_weather("hycom", np.nan, np.nan, np.nan, np.nan, ok=False, detail="exception")
 
     needs_fallback = (
-        _is_missing(hycom["sst"])
+        _is_missing(cmems["cmems_thetao"])
+        or _is_missing(hycom["sst"])
         or _is_missing(noaa["wind_speed"])
         or _is_missing(noaa["pressure"])
         or _is_missing(noaa["precipitation"])
@@ -291,11 +474,18 @@ def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
             open_meteo_detail = "" if open_meteo_ok else "empty"
 
     merged = {
-        "sst": _first_valid(hycom["sst"], open_meteo["sst"], default=26.0),
+        "sst": _first_valid(cmems["cmems_thetao"], hycom["sst"], open_meteo["sst"], default=26.0),
         "wind_speed": _first_valid(noaa["wind_speed"], open_meteo["wind_speed"], default=15.0),
         "pressure": _first_valid(noaa["pressure"], open_meteo["pressure"], default=1013.0),
         "precipitation": _first_valid(noaa["precipitation"], open_meteo["precipitation"], default=0.0),
+        "cmems_thetao": cmems["cmems_thetao"],
+        "cmems_so": cmems["cmems_so"],
+        "cmems_uo": cmems["cmems_uo"],
+        "cmems_vo": cmems["cmems_vo"],
+        "cmems_zos": cmems["cmems_zos"],
+        "cmems_current_speed": cmems["cmems_current_speed"],
         "provider_status": {
+            "cmems": {"ok": cmems.get("ok", False), "detail": cmems.get("detail", "")},
             "noaa": {"ok": noaa.get("ok", False), "detail": noaa.get("detail", "")},
             "hycom": {"ok": hycom.get("ok", False), "detail": hycom.get("detail", "")},
             "open_meteo": {"ok": open_meteo_ok, "detail": open_meteo_detail},
@@ -328,7 +518,9 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
         day = row["event_date"].date()
         key = f"{row['grid_lat']}_{row['grid_lon']}_{day.isoformat()}"
         if key not in weather_cache:
-            weather_cache[key] = _fetch_weather_row(row["grid_lat"], row["grid_lon"], day)
+            forcing = _fetch_ocean_forcing_row(row["grid_lat"], row["grid_lon"], day)
+            forcing.pop("provider_status", None)
+            weather_cache[key] = forcing
         weather_rows.append(weather_cache[key])
 
     weather_df = pd.DataFrame(weather_rows)
@@ -340,6 +532,12 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
         "wind_speed": 15.0,
         "pressure": 1013.0,
         "precipitation": 0.0,
+        "cmems_thetao": 26.0,
+        "cmems_so": 34.5,
+        "cmems_uo": 0.0,
+        "cmems_vo": 0.0,
+        "cmems_zos": 0.0,
+        "cmems_current_speed": 0.0,
     }
     for col, default in weather_defaults.items():
         feat[col] = pd.to_numeric(feat[col], errors="coerce")
@@ -365,9 +563,49 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_or_build_features(force_refresh: bool = False) -> pd.DataFrame:
-    if FEATURE_PATH.exists() and not force_refresh:
-        return pd.read_csv(FEATURE_PATH, parse_dates=["event_date"])
-    occurrences = fetch_occurrences() if (not RAW_PATH.exists() or force_refresh) else pd.read_csv(RAW_PATH, parse_dates=["event_date"])
+    def _load_and_merge(pattern: str, parse_dates: List[str]) -> pd.DataFrame:
+        paths = sorted(DATA_DIR.glob(pattern))
+        if FEATURE_PATH.exists() and pattern == FEATURE_DATASET_PATTERN and FEATURE_PATH not in paths:
+            paths.append(FEATURE_PATH)
+        if RAW_PATH.exists() and pattern == RAW_DATASET_PATTERN and RAW_PATH not in paths:
+            paths.append(RAW_PATH)
+
+        frames: List[pd.DataFrame] = []
+        for path in paths:
+            try:
+                frame = pd.read_csv(path, parse_dates=parse_dates)
+            except Exception:
+                continue
+            if not frame.empty:
+                frame["_source_file"] = path.name
+                frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        if "event_date" in merged.columns:
+            merged["event_date"] = pd.to_datetime(merged["event_date"], errors="coerce")
+        dedupe_cols = [
+            c
+            for c in ["species_name", "event_date", "grid_lat", "grid_lon", "lat", "lon", "basis_of_record", "activity_count", "catch_index"]
+            if c in merged.columns
+        ]
+        if dedupe_cols:
+            merged = merged.drop_duplicates(subset=dedupe_cols, keep="first")
+        return merged.drop(columns=["_source_file"], errors="ignore").reset_index(drop=True)
+
+    if not force_refresh:
+        merged_features = _load_and_merge(FEATURE_DATASET_PATTERN, parse_dates=["event_date"])
+        if not merged_features.empty:
+            return merged_features
+
+    if force_refresh:
+        occurrences = fetch_occurrences()
+    else:
+        merged_occurrences = _load_and_merge(RAW_DATASET_PATTERN, parse_dates=["event_date"])
+        occurrences = merged_occurrences if not merged_occurrences.empty else fetch_occurrences()
+
     return build_features(occurrences)
 
 
@@ -448,6 +686,7 @@ def build_prediction_features(
         if len(anchors) > MAX_FORCE_ANCHORS:
             anchors = anchors.iloc[:MAX_FORCE_ANCHORS].copy()
         anchor_weather_rows = []
+        cmems_ok = 0
         noaa_ok = 0
         hycom_ok = 0
         open_meteo_ok = 0
@@ -460,6 +699,7 @@ def build_prediction_features(
                 break
             forcing = _fetch_ocean_forcing_row(float(row["anchor_lat"]), float(row["anchor_lon"]), predict_date)
             status = forcing.pop("provider_status", {})
+            cmems_ok += 1 if status.get("cmems", {}).get("ok") else 0
             noaa_ok += 1 if status.get("noaa", {}).get("ok") else 0
             hycom_ok += 1 if status.get("hycom", {}).get("ok") else 0
             open_meteo_ok += 1 if status.get("open_meteo", {}).get("ok") else 0
@@ -480,6 +720,7 @@ def build_prediction_features(
                 )
         anchor_weather = pd.DataFrame(anchor_weather_rows)
         provider_summary = {
+            "cmems_ok_ratio": float(cmems_ok / fetched_anchors) if fetched_anchors else 0.0,
             "noaa_ok_ratio": float(noaa_ok / fetched_anchors) if fetched_anchors else 0.0,
             "hycom_ok_ratio": float(hycom_ok / fetched_anchors) if fetched_anchors else 0.0,
             "open_meteo_ok_ratio": float(open_meteo_ok / fetched_anchors) if fetched_anchors else 0.0,
@@ -505,6 +746,15 @@ def build_prediction_features(
     out["wind_speed"] = out["wind_speed"].fillna(out["wind_speed_hist"]).fillna(15.0)
     out["pressure"] = out["pressure"].fillna(out["pressure_hist"]).fillna(1013.0)
     out["precipitation"] = out["precipitation"].fillna(out["precipitation_hist"]).fillna(0.0)
+    for col in ["cmems_thetao", "cmems_so", "cmems_uo", "cmems_vo", "cmems_zos", "cmems_current_speed"]:
+        if col not in out.columns:
+            out[col] = np.nan
+    out["cmems_thetao"] = out["cmems_thetao"].fillna(out["sst"]).fillna(26.0)
+    out["cmems_so"] = out["cmems_so"].fillna(34.5)
+    out["cmems_uo"] = out["cmems_uo"].fillna(0.0)
+    out["cmems_vo"] = out["cmems_vo"].fillna(0.0)
+    out["cmems_zos"] = out["cmems_zos"].fillna(0.0)
+    out["cmems_current_speed"] = out["cmems_current_speed"].fillna(np.sqrt(out["cmems_uo"] ** 2 + out["cmems_vo"] ** 2))
 
     out["species_name"] = species_name
     out["event_date"] = pd.Timestamp(predict_date)
@@ -525,6 +775,12 @@ def build_prediction_features(
             "pressure",
             "precipitation",
             "activity_count",
+            "cmems_thetao",
+            "cmems_so",
+            "cmems_uo",
+            "cmems_vo",
+            "cmems_zos",
+            "cmems_current_speed",
         ]
     ].copy()
 

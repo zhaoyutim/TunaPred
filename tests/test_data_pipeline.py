@@ -86,13 +86,57 @@ class DataPipelineTests(unittest.TestCase):
             with (
                 patch.object(data_pipeline, "DATA_DIR", tmp_data_dir),
                 patch.object(data_pipeline, "RAW_PATH", tmp_raw),
+                patch("backend.data_pipeline._recent_years", return_value=[2023]),
                 patch("backend.data_pipeline._fetch_gbif_species_month", return_value=fake_occ),
+                patch("backend.data_pipeline._collect_near_realtime_occurrences", return_value=pd.DataFrame()),
             ):
                 out = data_pipeline.fetch_occurrences()
 
             self.assertTrue(tmp_raw.exists())
-            self.assertEqual(len(out), 36)  # 3 species * 12 months
+            self.assertEqual(len(out), 1)  # duplicate mock rows are deduplicated across loops
             self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
+
+
+    def test_collect_near_realtime_occurrences_combines_gbif_and_obis(self):
+        gbif_recent = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 1.0,
+                    "lon": 2.0,
+                    "event_date": "2025-01-01",
+                    "basis_of_record": "GBIF_RECENT",
+                }
+            ]
+        )
+        obis_recent = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 3.0,
+                    "lon": 4.0,
+                    "event_date": "2025-01-02",
+                    "basis_of_record": "OBIS_OCCURRENCE",
+                }
+            ]
+        )
+        with (
+            patch("backend.data_pipeline._fetch_gbif_species_recent", return_value=gbif_recent),
+            patch("backend.data_pipeline._fetch_obis_species_recent", return_value=obis_recent),
+        ):
+            out = data_pipeline._collect_near_realtime_occurrences(lookback_days=14)
+
+        self.assertEqual(len(out), 6)
+        self.assertIn("basis_of_record", out.columns)
+
+    def test_collect_near_realtime_occurrences_tolerates_provider_errors(self):
+        with (
+            patch("backend.data_pipeline._fetch_gbif_species_recent", side_effect=RuntimeError("gbif down")),
+            patch("backend.data_pipeline._fetch_obis_species_recent", return_value=pd.DataFrame()),
+        ):
+            out = data_pipeline._collect_near_realtime_occurrences(lookback_days=7)
+
+        self.assertTrue(out.empty)
 
     def test_load_or_build_features_force_refresh_triggers_download_and_build(self):
         fake_occ = pd.DataFrame(
@@ -144,6 +188,7 @@ class DataPipelineTests(unittest.TestCase):
             tmp_feat = Path(tmpdir) / "tuna_features_2023_06_07.csv"
             existing.to_csv(tmp_feat, index=False)
             with (
+                patch.object(data_pipeline, "DATA_DIR", Path(tmpdir)),
                 patch.object(data_pipeline, "FEATURE_PATH", tmp_feat),
                 patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
                 patch("backend.data_pipeline.build_features") as mock_build,
@@ -154,6 +199,90 @@ class DataPipelineTests(unittest.TestCase):
             self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
             mock_fetch.assert_not_called()
             mock_build.assert_not_called()
+
+    def test_load_or_build_features_merges_similar_feature_datasets(self):
+        first = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "event_date": "2023-06-01",
+                    "grid_lat": 1.0,
+                    "grid_lon": 2.0,
+                    "catch_index": 1.2,
+                }
+            ]
+        )
+        second = pd.DataFrame(
+            [
+                {
+                    "species_name": "Katsuwonus pelamis",
+                    "event_date": "2023-07-01",
+                    "grid_lat": 3.0,
+                    "grid_lon": 4.0,
+                    "catch_index": 1.6,
+                }
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_data = Path(tmpdir)
+            first.to_csv(tmp_data / "tuna_features_2023_06_07.csv", index=False)
+            second.to_csv(tmp_data / "tuna_features_2023.csv", index=False)
+            with (
+                patch.object(data_pipeline, "DATA_DIR", tmp_data),
+                patch.object(data_pipeline, "FEATURE_PATH", tmp_data / "tuna_features_2023.csv"),
+                patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
+                patch("backend.data_pipeline.build_features") as mock_build,
+            ):
+                out = data_pipeline.load_or_build_features(force_refresh=False)
+
+            self.assertEqual(len(out), 2)
+            self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
+            mock_fetch.assert_not_called()
+            mock_build.assert_not_called()
+
+    def test_load_or_build_features_merges_similar_raw_datasets_before_build(self):
+        raw_first = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 1.0,
+                    "lon": 2.0,
+                    "event_date": "2023-06-01",
+                    "basis_of_record": "HUMAN_OBSERVATION",
+                }
+            ]
+        )
+        raw_second = pd.DataFrame(
+            [
+                {
+                    "species_name": "Katsuwonus pelamis",
+                    "lat": 3.0,
+                    "lon": 4.0,
+                    "event_date": "2023-06-02",
+                    "basis_of_record": "HUMAN_OBSERVATION",
+                }
+            ]
+        )
+        fake_built = pd.DataFrame([{"species_name": "merged", "event_date": pd.Timestamp("2023-06-01")}])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_data = Path(tmpdir)
+            raw_first.to_csv(tmp_data / "tuna_occurrences_2023_06_07.csv", index=False)
+            raw_second.to_csv(tmp_data / "tuna_occurrences_2023.csv", index=False)
+            with (
+                patch.object(data_pipeline, "DATA_DIR", tmp_data),
+                patch.object(data_pipeline, "RAW_PATH", tmp_data / "tuna_occurrences_2023.csv"),
+                patch.object(data_pipeline, "FEATURE_PATH", tmp_data / "missing_features.csv"),
+                patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
+                patch("backend.data_pipeline.build_features", return_value=fake_built) as mock_build,
+            ):
+                out = data_pipeline.load_or_build_features(force_refresh=False)
+
+            self.assertEqual(len(out), 1)
+            mock_fetch.assert_not_called()
+            built_input = mock_build.call_args[0][0]
+            self.assertEqual(len(built_input), 2)
 
     def test_build_features_keeps_rows_when_sst_missing(self):
         occ = pd.DataFrame(
@@ -173,12 +302,19 @@ class DataPipelineTests(unittest.TestCase):
             with (
                 patch.object(data_pipeline, "FEATURE_PATH", tmp_feat),
                 patch(
-                    "backend.data_pipeline._fetch_weather_row",
+                    "backend.data_pipeline._fetch_ocean_forcing_row",
                     return_value={
                         "sst": float("nan"),
                         "wind_speed": 20.0,
                         "pressure": 1012.0,
                         "precipitation": 0.0,
+                        "cmems_thetao": 25.5,
+                        "cmems_so": 34.8,
+                        "cmems_uo": 0.2,
+                        "cmems_vo": 0.1,
+                        "cmems_zos": 0.0,
+                        "cmems_current_speed": 0.2236,
+                        "provider_status": {},
                     },
                 ),
             ):
@@ -222,7 +358,18 @@ class DataPipelineTests(unittest.TestCase):
             "wind_speed": 14.0,
             "pressure": 1011.0,
             "precipitation": 0.0,
-            "provider_status": {"noaa": {"ok": True, "detail": ""}, "hycom": {"ok": False, "detail": "placeholder"}},
+            "cmems_thetao": 27.0,
+            "cmems_so": 34.7,
+            "cmems_uo": 0.3,
+            "cmems_vo": 0.4,
+            "cmems_zos": 0.05,
+            "cmems_current_speed": 0.5,
+            "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
+                "noaa": {"ok": True, "detail": ""},
+                "hycom": {"ok": False, "detail": "placeholder"},
+                "open_meteo": {"ok": True, "detail": ""},
+            },
         }
         with (
             patch("backend.data_pipeline.load_or_build_features", return_value=hist),
@@ -241,20 +388,23 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(str(out.iloc[0]["event_date"])[:10], "2025-06-01")
         self.assertEqual(out.iloc[0]["month"], 6)
         self.assertEqual(out.iloc[0]["day"], 1)
+        self.assertIn("cmems_thetao", out.columns)
         self.assertIn("providers", meta)
 
     def test_fetch_ocean_forcing_row_normalizes_sources(self):
         noaa = {"sst": float("nan"), "wind_speed": 10.0, "pressure": 1009.0, "precipitation": 1.2, "ok": True, "detail": ""}
         hycom = {"sst": 25.5, "wind_speed": float("nan"), "pressure": float("nan"), "precipitation": float("nan"), "ok": True, "detail": ""}
+        cmems = {"cmems_thetao": 24.7, "cmems_so": 34.9, "cmems_uo": 0.2, "cmems_vo": 0.1, "cmems_zos": 0.01, "cmems_current_speed": 0.2236, "ok": True, "detail": ""}
         fallback = {"sst": 24.9, "wind_speed": 12.0, "pressure": 1011.0, "precipitation": 0.0}
         with (
+            patch("backend.data_pipeline._fetch_cmems_row", return_value=cmems),
             patch("backend.data_pipeline._fetch_noaa_row", return_value=noaa),
             patch("backend.data_pipeline._fetch_hycom_row", return_value=hycom),
             patch("backend.data_pipeline._fetch_weather_row", return_value=fallback),
         ):
             out = data_pipeline._fetch_ocean_forcing_row(1.0, 2.0, pd.Timestamp("2025-06-01").date())
 
-        self.assertEqual(out["sst"], 25.5)
+        self.assertEqual(out["sst"], 24.7)
         self.assertEqual(out["wind_speed"], 10.0)
         self.assertEqual(out["pressure"], 1009.0)
         self.assertEqual(out["precipitation"], 1.2)
@@ -284,7 +434,18 @@ class DataPipelineTests(unittest.TestCase):
             "wind_speed": 14.0,
             "pressure": 1011.0,
             "precipitation": 0.0,
-            "provider_status": {"noaa": {"ok": True, "detail": ""}, "hycom": {"ok": False, "detail": "placeholder"}},
+            "cmems_thetao": 27.0,
+            "cmems_so": 34.7,
+            "cmems_uo": 0.3,
+            "cmems_vo": 0.4,
+            "cmems_zos": 0.05,
+            "cmems_current_speed": 0.5,
+            "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
+                "noaa": {"ok": True, "detail": ""},
+                "hycom": {"ok": False, "detail": "placeholder"},
+                "open_meteo": {"ok": True, "detail": ""},
+            },
         }
         with (
             patch("backend.data_pipeline.load_or_build_features", return_value=hist),
@@ -330,6 +491,7 @@ class DataPipelineTests(unittest.TestCase):
             "pressure": 1011.0,
             "precipitation": 0.0,
             "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
                 "noaa": {"ok": True, "detail": ""},
                 "hycom": {"ok": False, "detail": "placeholder"},
                 "open_meteo": {"ok": True, "detail": ""},

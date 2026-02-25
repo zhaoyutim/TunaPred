@@ -51,6 +51,12 @@ class ModelingTests(unittest.TestCase):
                     "pressure": 1008.0 + (i % 3),
                     "precipitation": float(i % 4),
                     "activity_count": 1 + (i % 5),
+                    "cmems_thetao": 25.0 + (i % 2),
+                    "cmems_so": 34.5 + (i % 3) * 0.1,
+                    "cmems_uo": 0.1 * (i % 4),
+                    "cmems_vo": 0.1 * (i % 3),
+                    "cmems_zos": 0.01 * (i % 5),
+                    "cmems_current_speed": 0.2 + 0.01 * i,
                     "catch_index": 0.5 + i * 0.1,
                 }
             )

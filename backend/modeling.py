@@ -67,7 +67,7 @@ def _get_lightgbm():
 
 MODEL_DIR = Path("models")
 MODEL_PATH = MODEL_DIR / "tuna_lgbm_ensemble.joblib"
-FEATURES = ["species_id", "grid_lat", "grid_lon", "month", "day", "sst", "wind_speed", "pressure", "precipitation", "activity_count"]
+FEATURES = ["species_id", "grid_lat", "grid_lon", "month", "day", "sst", "wind_speed", "pressure", "precipitation", "activity_count", "cmems_thetao", "cmems_so", "cmems_uo", "cmems_vo", "cmems_zos", "cmems_current_speed"]
 TARGET = "catch_index"
 
 
