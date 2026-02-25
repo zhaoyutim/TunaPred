@@ -3,6 +3,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import math
+import os
 import time
 from pathlib import Path
 from typing import Dict, List, Tuple
@@ -31,6 +32,8 @@ FEATURE_DATASET_PATTERN = "tuna_features_*.csv"
 RAW_DATASET_PATTERN = "tuna_occurrences_*.csv"
 REALTIME_LOOKBACK_DAYS = 60
 HISTORICAL_YEARS = 3
+CMEMS_DATASET_ID = os.getenv("CMEMS_DATASET_ID", "cmems_mod_glo_phy_anfc_0.083deg_P1D-m")
+CMEMS_VARS = ["thetao", "so", "uo", "vo", "zos"]
 
 CHINA_SEAS_BBOX = {
     "lat_min": 5.0,
@@ -375,12 +378,71 @@ def _fetch_weather_row(lat: float, lon: float, day: dt.date) -> Dict:
     }
 
 
+
+
+def _fetch_cmems_row(lat: float, lon: float, day: dt.date) -> Dict:
+    default = {
+        "cmems_thetao": np.nan,
+        "cmems_so": np.nan,
+        "cmems_uo": np.nan,
+        "cmems_vo": np.nan,
+        "cmems_zos": np.nan,
+        "cmems_current_speed": np.nan,
+        "ok": False,
+        "detail": "unavailable",
+    }
+    try:
+        cm = __import__("copernicusmarine")
+    except Exception:
+        return default
+
+    try:
+        ds = cm.open_dataset(
+            dataset_id=CMEMS_DATASET_ID,
+            variables=CMEMS_VARS,
+            minimum_longitude=float(lon),
+            maximum_longitude=float(lon),
+            minimum_latitude=float(lat),
+            maximum_latitude=float(lat),
+            start_datetime=f"{day.isoformat()}T00:00:00",
+            end_datetime=f"{day.isoformat()}T23:59:59",
+        )
+    except Exception as exc:
+        default["detail"] = type(exc).__name__
+        return default
+
+    try:
+        thetao = float(ds["thetao"].mean().values) if "thetao" in ds else np.nan
+        so = float(ds["so"].mean().values) if "so" in ds else np.nan
+        uo = float(ds["uo"].mean().values) if "uo" in ds else np.nan
+        vo = float(ds["vo"].mean().values) if "vo" in ds else np.nan
+        zos = float(ds["zos"].mean().values) if "zos" in ds else np.nan
+        speed = float(math.sqrt((uo if not _is_missing(uo) else 0.0) ** 2 + (vo if not _is_missing(vo) else 0.0) ** 2)) if (not _is_missing(uo) or not _is_missing(vo)) else np.nan
+    except Exception as exc:
+        default["detail"] = f"parse_{type(exc).__name__}"
+        return default
+
+    return {
+        "cmems_thetao": thetao,
+        "cmems_so": so,
+        "cmems_uo": uo,
+        "cmems_vo": vo,
+        "cmems_zos": zos,
+        "cmems_current_speed": speed,
+        "ok": True,
+        "detail": "",
+    }
+
 def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
     cache_key = (round(lat, 4), round(lon, 4), day.isoformat())
     if cache_key in _FORCING_CACHE:
         return _FORCING_CACHE[cache_key]
 
-    # NOAA/HYCOM are primary targets; if unavailable, fallback to existing Open-Meteo path.
+    # CMEMS + NOAA/HYCOM are primary targets; fallback to existing Open-Meteo path.
+    try:
+        cmems = _fetch_cmems_row(lat, lon, day)
+    except Exception:
+        cmems = {"cmems_thetao": np.nan, "cmems_so": np.nan, "cmems_uo": np.nan, "cmems_vo": np.nan, "cmems_zos": np.nan, "cmems_current_speed": np.nan, "ok": False, "detail": "exception"}
     try:
         noaa = _fetch_noaa_row(lat, lon, day, timeout=4)
     except Exception:
@@ -391,7 +453,8 @@ def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
         hycom = _normalize_weather("hycom", np.nan, np.nan, np.nan, np.nan, ok=False, detail="exception")
 
     needs_fallback = (
-        _is_missing(hycom["sst"])
+        _is_missing(cmems["cmems_thetao"])
+        or _is_missing(hycom["sst"])
         or _is_missing(noaa["wind_speed"])
         or _is_missing(noaa["pressure"])
         or _is_missing(noaa["precipitation"])
@@ -411,11 +474,18 @@ def _fetch_ocean_forcing_row(lat: float, lon: float, day: dt.date) -> Dict:
             open_meteo_detail = "" if open_meteo_ok else "empty"
 
     merged = {
-        "sst": _first_valid(hycom["sst"], open_meteo["sst"], default=26.0),
+        "sst": _first_valid(cmems["cmems_thetao"], hycom["sst"], open_meteo["sst"], default=26.0),
         "wind_speed": _first_valid(noaa["wind_speed"], open_meteo["wind_speed"], default=15.0),
         "pressure": _first_valid(noaa["pressure"], open_meteo["pressure"], default=1013.0),
         "precipitation": _first_valid(noaa["precipitation"], open_meteo["precipitation"], default=0.0),
+        "cmems_thetao": cmems["cmems_thetao"],
+        "cmems_so": cmems["cmems_so"],
+        "cmems_uo": cmems["cmems_uo"],
+        "cmems_vo": cmems["cmems_vo"],
+        "cmems_zos": cmems["cmems_zos"],
+        "cmems_current_speed": cmems["cmems_current_speed"],
         "provider_status": {
+            "cmems": {"ok": cmems.get("ok", False), "detail": cmems.get("detail", "")},
             "noaa": {"ok": noaa.get("ok", False), "detail": noaa.get("detail", "")},
             "hycom": {"ok": hycom.get("ok", False), "detail": hycom.get("detail", "")},
             "open_meteo": {"ok": open_meteo_ok, "detail": open_meteo_detail},
@@ -448,7 +518,9 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
         day = row["event_date"].date()
         key = f"{row['grid_lat']}_{row['grid_lon']}_{day.isoformat()}"
         if key not in weather_cache:
-            weather_cache[key] = _fetch_weather_row(row["grid_lat"], row["grid_lon"], day)
+            forcing = _fetch_ocean_forcing_row(row["grid_lat"], row["grid_lon"], day)
+            forcing.pop("provider_status", None)
+            weather_cache[key] = forcing
         weather_rows.append(weather_cache[key])
 
     weather_df = pd.DataFrame(weather_rows)
@@ -460,6 +532,12 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
         "wind_speed": 15.0,
         "pressure": 1013.0,
         "precipitation": 0.0,
+        "cmems_thetao": 26.0,
+        "cmems_so": 34.5,
+        "cmems_uo": 0.0,
+        "cmems_vo": 0.0,
+        "cmems_zos": 0.0,
+        "cmems_current_speed": 0.0,
     }
     for col, default in weather_defaults.items():
         feat[col] = pd.to_numeric(feat[col], errors="coerce")
@@ -608,6 +686,7 @@ def build_prediction_features(
         if len(anchors) > MAX_FORCE_ANCHORS:
             anchors = anchors.iloc[:MAX_FORCE_ANCHORS].copy()
         anchor_weather_rows = []
+        cmems_ok = 0
         noaa_ok = 0
         hycom_ok = 0
         open_meteo_ok = 0
@@ -620,6 +699,7 @@ def build_prediction_features(
                 break
             forcing = _fetch_ocean_forcing_row(float(row["anchor_lat"]), float(row["anchor_lon"]), predict_date)
             status = forcing.pop("provider_status", {})
+            cmems_ok += 1 if status.get("cmems", {}).get("ok") else 0
             noaa_ok += 1 if status.get("noaa", {}).get("ok") else 0
             hycom_ok += 1 if status.get("hycom", {}).get("ok") else 0
             open_meteo_ok += 1 if status.get("open_meteo", {}).get("ok") else 0
@@ -640,6 +720,7 @@ def build_prediction_features(
                 )
         anchor_weather = pd.DataFrame(anchor_weather_rows)
         provider_summary = {
+            "cmems_ok_ratio": float(cmems_ok / fetched_anchors) if fetched_anchors else 0.0,
             "noaa_ok_ratio": float(noaa_ok / fetched_anchors) if fetched_anchors else 0.0,
             "hycom_ok_ratio": float(hycom_ok / fetched_anchors) if fetched_anchors else 0.0,
             "open_meteo_ok_ratio": float(open_meteo_ok / fetched_anchors) if fetched_anchors else 0.0,
@@ -665,6 +746,15 @@ def build_prediction_features(
     out["wind_speed"] = out["wind_speed"].fillna(out["wind_speed_hist"]).fillna(15.0)
     out["pressure"] = out["pressure"].fillna(out["pressure_hist"]).fillna(1013.0)
     out["precipitation"] = out["precipitation"].fillna(out["precipitation_hist"]).fillna(0.0)
+    for col in ["cmems_thetao", "cmems_so", "cmems_uo", "cmems_vo", "cmems_zos", "cmems_current_speed"]:
+        if col not in out.columns:
+            out[col] = np.nan
+    out["cmems_thetao"] = out["cmems_thetao"].fillna(out["sst"]).fillna(26.0)
+    out["cmems_so"] = out["cmems_so"].fillna(34.5)
+    out["cmems_uo"] = out["cmems_uo"].fillna(0.0)
+    out["cmems_vo"] = out["cmems_vo"].fillna(0.0)
+    out["cmems_zos"] = out["cmems_zos"].fillna(0.0)
+    out["cmems_current_speed"] = out["cmems_current_speed"].fillna(np.sqrt(out["cmems_uo"] ** 2 + out["cmems_vo"] ** 2))
 
     out["species_name"] = species_name
     out["event_date"] = pd.Timestamp(predict_date)
@@ -685,6 +775,12 @@ def build_prediction_features(
             "pressure",
             "precipitation",
             "activity_count",
+            "cmems_thetao",
+            "cmems_so",
+            "cmems_uo",
+            "cmems_vo",
+            "cmems_zos",
+            "cmems_current_speed",
         ]
     ].copy()
 

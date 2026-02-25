@@ -302,12 +302,19 @@ class DataPipelineTests(unittest.TestCase):
             with (
                 patch.object(data_pipeline, "FEATURE_PATH", tmp_feat),
                 patch(
-                    "backend.data_pipeline._fetch_weather_row",
+                    "backend.data_pipeline._fetch_ocean_forcing_row",
                     return_value={
                         "sst": float("nan"),
                         "wind_speed": 20.0,
                         "pressure": 1012.0,
                         "precipitation": 0.0,
+                        "cmems_thetao": 25.5,
+                        "cmems_so": 34.8,
+                        "cmems_uo": 0.2,
+                        "cmems_vo": 0.1,
+                        "cmems_zos": 0.0,
+                        "cmems_current_speed": 0.2236,
+                        "provider_status": {},
                     },
                 ),
             ):
@@ -351,7 +358,18 @@ class DataPipelineTests(unittest.TestCase):
             "wind_speed": 14.0,
             "pressure": 1011.0,
             "precipitation": 0.0,
-            "provider_status": {"noaa": {"ok": True, "detail": ""}, "hycom": {"ok": False, "detail": "placeholder"}},
+            "cmems_thetao": 27.0,
+            "cmems_so": 34.7,
+            "cmems_uo": 0.3,
+            "cmems_vo": 0.4,
+            "cmems_zos": 0.05,
+            "cmems_current_speed": 0.5,
+            "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
+                "noaa": {"ok": True, "detail": ""},
+                "hycom": {"ok": False, "detail": "placeholder"},
+                "open_meteo": {"ok": True, "detail": ""},
+            },
         }
         with (
             patch("backend.data_pipeline.load_or_build_features", return_value=hist),
@@ -370,20 +388,23 @@ class DataPipelineTests(unittest.TestCase):
         self.assertEqual(str(out.iloc[0]["event_date"])[:10], "2025-06-01")
         self.assertEqual(out.iloc[0]["month"], 6)
         self.assertEqual(out.iloc[0]["day"], 1)
+        self.assertIn("cmems_thetao", out.columns)
         self.assertIn("providers", meta)
 
     def test_fetch_ocean_forcing_row_normalizes_sources(self):
         noaa = {"sst": float("nan"), "wind_speed": 10.0, "pressure": 1009.0, "precipitation": 1.2, "ok": True, "detail": ""}
         hycom = {"sst": 25.5, "wind_speed": float("nan"), "pressure": float("nan"), "precipitation": float("nan"), "ok": True, "detail": ""}
+        cmems = {"cmems_thetao": 24.7, "cmems_so": 34.9, "cmems_uo": 0.2, "cmems_vo": 0.1, "cmems_zos": 0.01, "cmems_current_speed": 0.2236, "ok": True, "detail": ""}
         fallback = {"sst": 24.9, "wind_speed": 12.0, "pressure": 1011.0, "precipitation": 0.0}
         with (
+            patch("backend.data_pipeline._fetch_cmems_row", return_value=cmems),
             patch("backend.data_pipeline._fetch_noaa_row", return_value=noaa),
             patch("backend.data_pipeline._fetch_hycom_row", return_value=hycom),
             patch("backend.data_pipeline._fetch_weather_row", return_value=fallback),
         ):
             out = data_pipeline._fetch_ocean_forcing_row(1.0, 2.0, pd.Timestamp("2025-06-01").date())
 
-        self.assertEqual(out["sst"], 25.5)
+        self.assertEqual(out["sst"], 24.7)
         self.assertEqual(out["wind_speed"], 10.0)
         self.assertEqual(out["pressure"], 1009.0)
         self.assertEqual(out["precipitation"], 1.2)
@@ -413,7 +434,18 @@ class DataPipelineTests(unittest.TestCase):
             "wind_speed": 14.0,
             "pressure": 1011.0,
             "precipitation": 0.0,
-            "provider_status": {"noaa": {"ok": True, "detail": ""}, "hycom": {"ok": False, "detail": "placeholder"}},
+            "cmems_thetao": 27.0,
+            "cmems_so": 34.7,
+            "cmems_uo": 0.3,
+            "cmems_vo": 0.4,
+            "cmems_zos": 0.05,
+            "cmems_current_speed": 0.5,
+            "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
+                "noaa": {"ok": True, "detail": ""},
+                "hycom": {"ok": False, "detail": "placeholder"},
+                "open_meteo": {"ok": True, "detail": ""},
+            },
         }
         with (
             patch("backend.data_pipeline.load_or_build_features", return_value=hist),
@@ -459,6 +491,7 @@ class DataPipelineTests(unittest.TestCase):
             "pressure": 1011.0,
             "precipitation": 0.0,
             "provider_status": {
+                "cmems": {"ok": True, "detail": ""},
                 "noaa": {"ok": True, "detail": ""},
                 "hycom": {"ok": False, "detail": "placeholder"},
                 "open_meteo": {"ok": True, "detail": ""},
