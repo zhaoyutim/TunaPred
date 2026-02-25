@@ -86,13 +86,57 @@ class DataPipelineTests(unittest.TestCase):
             with (
                 patch.object(data_pipeline, "DATA_DIR", tmp_data_dir),
                 patch.object(data_pipeline, "RAW_PATH", tmp_raw),
+                patch("backend.data_pipeline._recent_years", return_value=[2023]),
                 patch("backend.data_pipeline._fetch_gbif_species_month", return_value=fake_occ),
+                patch("backend.data_pipeline._collect_near_realtime_occurrences", return_value=pd.DataFrame()),
             ):
                 out = data_pipeline.fetch_occurrences()
 
             self.assertTrue(tmp_raw.exists())
-            self.assertEqual(len(out), 36)  # 3 species * 12 months
+            self.assertEqual(len(out), 1)  # duplicate mock rows are deduplicated across loops
             self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
+
+
+    def test_collect_near_realtime_occurrences_combines_gbif_and_obis(self):
+        gbif_recent = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 1.0,
+                    "lon": 2.0,
+                    "event_date": "2025-01-01",
+                    "basis_of_record": "GBIF_RECENT",
+                }
+            ]
+        )
+        obis_recent = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 3.0,
+                    "lon": 4.0,
+                    "event_date": "2025-01-02",
+                    "basis_of_record": "OBIS_OCCURRENCE",
+                }
+            ]
+        )
+        with (
+            patch("backend.data_pipeline._fetch_gbif_species_recent", return_value=gbif_recent),
+            patch("backend.data_pipeline._fetch_obis_species_recent", return_value=obis_recent),
+        ):
+            out = data_pipeline._collect_near_realtime_occurrences(lookback_days=14)
+
+        self.assertEqual(len(out), 6)
+        self.assertIn("basis_of_record", out.columns)
+
+    def test_collect_near_realtime_occurrences_tolerates_provider_errors(self):
+        with (
+            patch("backend.data_pipeline._fetch_gbif_species_recent", side_effect=RuntimeError("gbif down")),
+            patch("backend.data_pipeline._fetch_obis_species_recent", return_value=pd.DataFrame()),
+        ):
+            out = data_pipeline._collect_near_realtime_occurrences(lookback_days=7)
+
+        self.assertTrue(out.empty)
 
     def test_load_or_build_features_force_refresh_triggers_download_and_build(self):
         fake_occ = pd.DataFrame(
@@ -144,6 +188,7 @@ class DataPipelineTests(unittest.TestCase):
             tmp_feat = Path(tmpdir) / "tuna_features_2023_06_07.csv"
             existing.to_csv(tmp_feat, index=False)
             with (
+                patch.object(data_pipeline, "DATA_DIR", Path(tmpdir)),
                 patch.object(data_pipeline, "FEATURE_PATH", tmp_feat),
                 patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
                 patch("backend.data_pipeline.build_features") as mock_build,
@@ -154,6 +199,90 @@ class DataPipelineTests(unittest.TestCase):
             self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
             mock_fetch.assert_not_called()
             mock_build.assert_not_called()
+
+    def test_load_or_build_features_merges_similar_feature_datasets(self):
+        first = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "event_date": "2023-06-01",
+                    "grid_lat": 1.0,
+                    "grid_lon": 2.0,
+                    "catch_index": 1.2,
+                }
+            ]
+        )
+        second = pd.DataFrame(
+            [
+                {
+                    "species_name": "Katsuwonus pelamis",
+                    "event_date": "2023-07-01",
+                    "grid_lat": 3.0,
+                    "grid_lon": 4.0,
+                    "catch_index": 1.6,
+                }
+            ]
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_data = Path(tmpdir)
+            first.to_csv(tmp_data / "tuna_features_2023_06_07.csv", index=False)
+            second.to_csv(tmp_data / "tuna_features_2023.csv", index=False)
+            with (
+                patch.object(data_pipeline, "DATA_DIR", tmp_data),
+                patch.object(data_pipeline, "FEATURE_PATH", tmp_data / "tuna_features_2023.csv"),
+                patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
+                patch("backend.data_pipeline.build_features") as mock_build,
+            ):
+                out = data_pipeline.load_or_build_features(force_refresh=False)
+
+            self.assertEqual(len(out), 2)
+            self.assertTrue(pd.api.types.is_datetime64_any_dtype(out["event_date"]))
+            mock_fetch.assert_not_called()
+            mock_build.assert_not_called()
+
+    def test_load_or_build_features_merges_similar_raw_datasets_before_build(self):
+        raw_first = pd.DataFrame(
+            [
+                {
+                    "species_name": "Thunnus albacares",
+                    "lat": 1.0,
+                    "lon": 2.0,
+                    "event_date": "2023-06-01",
+                    "basis_of_record": "HUMAN_OBSERVATION",
+                }
+            ]
+        )
+        raw_second = pd.DataFrame(
+            [
+                {
+                    "species_name": "Katsuwonus pelamis",
+                    "lat": 3.0,
+                    "lon": 4.0,
+                    "event_date": "2023-06-02",
+                    "basis_of_record": "HUMAN_OBSERVATION",
+                }
+            ]
+        )
+        fake_built = pd.DataFrame([{"species_name": "merged", "event_date": pd.Timestamp("2023-06-01")}])
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_data = Path(tmpdir)
+            raw_first.to_csv(tmp_data / "tuna_occurrences_2023_06_07.csv", index=False)
+            raw_second.to_csv(tmp_data / "tuna_occurrences_2023.csv", index=False)
+            with (
+                patch.object(data_pipeline, "DATA_DIR", tmp_data),
+                patch.object(data_pipeline, "RAW_PATH", tmp_data / "tuna_occurrences_2023.csv"),
+                patch.object(data_pipeline, "FEATURE_PATH", tmp_data / "missing_features.csv"),
+                patch("backend.data_pipeline.fetch_occurrences") as mock_fetch,
+                patch("backend.data_pipeline.build_features", return_value=fake_built) as mock_build,
+            ):
+                out = data_pipeline.load_or_build_features(force_refresh=False)
+
+            self.assertEqual(len(out), 1)
+            mock_fetch.assert_not_called()
+            built_input = mock_build.call_args[0][0]
+            self.assertEqual(len(built_input), 2)
 
     def test_build_features_keeps_rows_when_sst_missing(self):
         occ = pd.DataFrame(

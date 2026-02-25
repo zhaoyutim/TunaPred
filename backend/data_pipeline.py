@@ -18,6 +18,7 @@ SPECIES = {
 }
 
 GBIF_URL = "https://api.gbif.org/v1/occurrence/search"
+OBIS_URL = "https://api.obis.org/v3/occurrence"
 OPEN_METEO_URL = "https://archive-api.open-meteo.com/v1/archive"
 NOAA_GFS_POINT_URL = "https://api.open-meteo.com/v1/forecast"
 HYCOM_PLACEHOLDER_URL = "https://ncss.hycom.org/thredds/ncss/GLBy0.08/expt_93.0"
@@ -26,6 +27,10 @@ DATA_DIR = Path("data")
 RAW_PATH = DATA_DIR / "tuna_occurrences_2023.csv"
 FEATURE_PATH = DATA_DIR / "tuna_features_2023.csv"
 PREDICTION_CACHE_DIR = DATA_DIR / "predictions"
+FEATURE_DATASET_PATTERN = "tuna_features_*.csv"
+RAW_DATASET_PATTERN = "tuna_occurrences_*.csv"
+REALTIME_LOOKBACK_DAYS = 60
+HISTORICAL_YEARS = 3
 
 CHINA_SEAS_BBOX = {
     "lat_min": 5.0,
@@ -169,19 +174,134 @@ def _fetch_gbif_species_month(scientific_name: str, month: int, year: int = TRAI
     return pd.DataFrame(rows)
 
 
+def _recent_years(total_years: int = HISTORICAL_YEARS) -> List[int]:
+    current_year = dt.date.today().year
+    base_years = {TRAIN_YEAR, current_year}
+    for shift in range(max(total_years - 1, 0)):
+        base_years.add(current_year - shift)
+    return sorted(base_years)
+
+
+def _fetch_gbif_species_recent(scientific_name: str, start_date: dt.date, end_date: dt.date, max_rows: int = 300) -> pd.DataFrame:
+    rows: List[Dict] = []
+    limit = 100
+    offset = 0
+    while offset < max_rows:
+        params = {
+            "scientificName": scientific_name,
+            "hasCoordinate": "true",
+            "eventDate": f"{start_date.isoformat()},{end_date.isoformat()}",
+            "limit": limit,
+            "offset": offset,
+        }
+        resp = requests.get(GBIF_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results", [])
+        if not results:
+            break
+        for item in results:
+            if "decimalLatitude" not in item or "decimalLongitude" not in item:
+                continue
+            event_date = item.get("eventDate")
+            if not event_date:
+                continue
+            rows.append(
+                {
+                    "species_name": scientific_name,
+                    "lat": float(item["decimalLatitude"]),
+                    "lon": float(item["decimalLongitude"]),
+                    "event_date": event_date[:10],
+                    "basis_of_record": item.get("basisOfRecord", "GBIF_RECENT"),
+                }
+            )
+        offset += limit
+    return pd.DataFrame(rows)
+
+
+def _fetch_obis_species_recent(scientific_name: str, start_date: dt.date, end_date: dt.date, max_rows: int = 300) -> pd.DataFrame:
+    rows: List[Dict] = []
+    size = 100
+    start = 0
+    while start < max_rows:
+        params = {
+            "scientificname": scientific_name,
+            "startdate": start_date.isoformat(),
+            "enddate": end_date.isoformat(),
+            "size": size,
+            "from": start,
+            "hascoords": "true",
+        }
+        resp = requests.get(OBIS_URL, params=params, timeout=30)
+        resp.raise_for_status()
+        payload = resp.json()
+        results = payload.get("results", [])
+        if not results:
+            break
+        for item in results:
+            lat = item.get("decimalLatitude")
+            lon = item.get("decimalLongitude")
+            event_date = item.get("eventDate") or item.get("date_mid")
+            if lat is None or lon is None or not event_date:
+                continue
+            rows.append(
+                {
+                    "species_name": scientific_name,
+                    "lat": float(lat),
+                    "lon": float(lon),
+                    "event_date": str(event_date)[:10],
+                    "basis_of_record": item.get("basisOfRecord") or "OBIS_OCCURRENCE",
+                }
+            )
+        start += size
+    return pd.DataFrame(rows)
+
+
+def _collect_near_realtime_occurrences(lookback_days: int = REALTIME_LOOKBACK_DAYS) -> pd.DataFrame:
+    end_date = dt.date.today()
+    start_date = end_date - dt.timedelta(days=lookback_days)
+    frames: List[pd.DataFrame] = []
+    for sci_name in SPECIES.values():
+        try:
+            gbif_recent = _fetch_gbif_species_recent(sci_name, start_date=start_date, end_date=end_date)
+        except Exception:
+            gbif_recent = pd.DataFrame()
+        if not gbif_recent.empty:
+            frames.append(gbif_recent)
+
+        try:
+            obis_recent = _fetch_obis_species_recent(sci_name, start_date=start_date, end_date=end_date)
+        except Exception:
+            obis_recent = pd.DataFrame()
+        if not obis_recent.empty:
+            frames.append(obis_recent)
+
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
 def fetch_occurrences() -> pd.DataFrame:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     all_frames: List[pd.DataFrame] = []
-    for _, sci_name in SPECIES.items():
-        for month in range(1, 13):
-            frame = _fetch_gbif_species_month(sci_name, month)
-            if not frame.empty:
-                all_frames.append(frame)
+    for sci_name in SPECIES.values():
+        for year in _recent_years():
+            for month in range(1, 13):
+                frame = _fetch_gbif_species_month(sci_name, month, year=year)
+                if not frame.empty:
+                    all_frames.append(frame)
+
+    recent = _collect_near_realtime_occurrences()
+    if not recent.empty:
+        all_frames.append(recent)
+
     if not all_frames:
-        raise RuntimeError("No tuna occurrence data fetched from GBIF.")
+        raise RuntimeError("No tuna occurrence data fetched from internet sources.")
+
     out = pd.concat(all_frames, ignore_index=True)
     out["event_date"] = pd.to_datetime(out["event_date"], errors="coerce")
-    out = out.dropna(subset=["event_date"]).copy()
+    out = out.dropna(subset=["event_date", "lat", "lon", "species_name"]).copy()
+    out = out.drop_duplicates(subset=["species_name", "lat", "lon", "event_date", "basis_of_record"], keep="first")
     out.to_csv(RAW_PATH, index=False)
     return out
 
@@ -365,9 +485,49 @@ def build_features(occurrences: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_or_build_features(force_refresh: bool = False) -> pd.DataFrame:
-    if FEATURE_PATH.exists() and not force_refresh:
-        return pd.read_csv(FEATURE_PATH, parse_dates=["event_date"])
-    occurrences = fetch_occurrences() if (not RAW_PATH.exists() or force_refresh) else pd.read_csv(RAW_PATH, parse_dates=["event_date"])
+    def _load_and_merge(pattern: str, parse_dates: List[str]) -> pd.DataFrame:
+        paths = sorted(DATA_DIR.glob(pattern))
+        if FEATURE_PATH.exists() and pattern == FEATURE_DATASET_PATTERN and FEATURE_PATH not in paths:
+            paths.append(FEATURE_PATH)
+        if RAW_PATH.exists() and pattern == RAW_DATASET_PATTERN and RAW_PATH not in paths:
+            paths.append(RAW_PATH)
+
+        frames: List[pd.DataFrame] = []
+        for path in paths:
+            try:
+                frame = pd.read_csv(path, parse_dates=parse_dates)
+            except Exception:
+                continue
+            if not frame.empty:
+                frame["_source_file"] = path.name
+                frames.append(frame)
+
+        if not frames:
+            return pd.DataFrame()
+
+        merged = pd.concat(frames, ignore_index=True)
+        if "event_date" in merged.columns:
+            merged["event_date"] = pd.to_datetime(merged["event_date"], errors="coerce")
+        dedupe_cols = [
+            c
+            for c in ["species_name", "event_date", "grid_lat", "grid_lon", "lat", "lon", "basis_of_record", "activity_count", "catch_index"]
+            if c in merged.columns
+        ]
+        if dedupe_cols:
+            merged = merged.drop_duplicates(subset=dedupe_cols, keep="first")
+        return merged.drop(columns=["_source_file"], errors="ignore").reset_index(drop=True)
+
+    if not force_refresh:
+        merged_features = _load_and_merge(FEATURE_DATASET_PATTERN, parse_dates=["event_date"])
+        if not merged_features.empty:
+            return merged_features
+
+    if force_refresh:
+        occurrences = fetch_occurrences()
+    else:
+        merged_occurrences = _load_and_merge(RAW_DATASET_PATTERN, parse_dates=["event_date"])
+        occurrences = merged_occurrences if not merged_occurrences.empty else fetch_occurrences()
+
     return build_features(occurrences)
 
 
