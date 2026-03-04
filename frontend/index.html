@@ -3,76 +3,443 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0" />
+    <meta http-equiv="Pragma" content="no-cache" />
+    <meta http-equiv="Expires" content="0" />
     <title>TunaPred Demo</title>
     <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
     <style>
-      body { font-family: Arial, sans-serif; margin: 20px; }
-      .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
-      #chart { width: 100%; height: 70vh; }
-      #status { margin: 8px 0; color: #444; }
-      button { padding: 6px 12px; }
+      :root {
+        --bg0: #030914;
+        --bg1: #071a33;
+        --line: #1ca6ff66;
+        --panel: #0b203ebf;
+        --panel-strong: #112d55d8;
+        --text: #d8f1ff;
+        --muted: #8bb8d6;
+        --accent: #26d4ff;
+        --accent-2: #5b8dff;
+      }
+
+      * { box-sizing: border-box; }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Segoe UI", Arial, sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at 12% 15%, #1d4e9e55, transparent 32%),
+          radial-gradient(circle at 86% 14%, #06a8ff44, transparent 28%),
+          linear-gradient(180deg, var(--bg1), var(--bg0));
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(var(--line) 1px, transparent 1px),
+          linear-gradient(90deg, var(--line) 1px, transparent 1px);
+        background-size: 36px 36px;
+        opacity: 0.24;
+      }
+
+      .app {
+        position: relative;
+        z-index: 1;
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 20px;
+      }
+
+      .topbar {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        margin-bottom: 16px;
+        padding: 14px 18px;
+        background: linear-gradient(135deg, #0d2c57b3, #133f71a3);
+        border: 1px solid #39d5ff66;
+        border-radius: 14px;
+        box-shadow: 0 0 24px #0bb8ff33, inset 0 0 24px #88dbff0d;
+      }
+
+      .title {
+        margin: 0;
+        font-size: 22px;
+        letter-spacing: 0.5px;
+      }
+
+      .subtitle {
+        margin: 3px 0 0;
+        color: var(--muted);
+        font-size: 12px;
+      }
+
+      .api-badge {
+        font-size: 12px;
+        color: #bfefff;
+        border: 1px solid #58d6ff70;
+        background: #0e2f5bb3;
+        border-radius: 999px;
+        padding: 5px 10px;
+      }
+
+      .layout {
+        display: grid;
+        grid-template-columns: 320px 1fr;
+        gap: 16px;
+      }
+
+      .panel {
+        background: var(--panel);
+        border: 1px solid #31c9ff4d;
+        border-radius: 14px;
+        backdrop-filter: blur(8px);
+        box-shadow: inset 0 0 20px #56b8ff14;
+      }
+
+      .left-panel { padding: 14px; }
+
+      .panel-title {
+        font-size: 13px;
+        color: #96deff;
+        letter-spacing: 0.8px;
+        margin: 0 0 12px;
+      }
+
+      .controls {
+        display: grid;
+        gap: 10px;
+      }
+
+      button,
+      select,
+      input {
+        width: 100%;
+        border: 1px solid #43d4ff61;
+        border-radius: 10px;
+        padding: 11px 12px;
+        font-size: 14px;
+        color: var(--text);
+        background: #0f2b51;
+      }
+
+      button {
+        cursor: pointer;
+        font-weight: 600;
+        background: linear-gradient(120deg, #1b3f78, #195d8f);
+        box-shadow: 0 0 14px #1a98ff29;
+      }
+
+      button:hover {
+        background: linear-gradient(120deg, #225390, #1d77ae);
+        transform: translateY(-1px);
+      }
+
+      .status {
+        margin-top: 12px;
+        border: 1px solid #48d9ff45;
+        border-radius: 10px;
+        padding: 10px;
+        background: #0b2244d9;
+        color: #bbebff;
+        min-height: 60px;
+        font-size: 13px;
+        line-height: 1.35;
+      }
+
+      .metrics {
+        margin-top: 12px;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        gap: 8px;
+      }
+
+      .metric {
+        background: var(--panel-strong);
+        border: 1px solid #39cbff3b;
+        border-radius: 10px;
+        padding: 8px;
+      }
+
+      .metric-label {
+        color: #8bc3e3;
+        font-size: 11px;
+      }
+
+      .metric-value {
+        margin-top: 4px;
+        font-size: 16px;
+        font-weight: 700;
+        color: #dbf6ff;
+      }
+
+      .chart-panel { padding: 10px; }
+
+      #chart {
+        width: 100%;
+        height: calc(100vh - 150px);
+        min-height: 560px;
+        border-radius: 12px;
+        overflow: hidden;
+      }
+
+      @media (max-width: 1000px) {
+        .layout { grid-template-columns: 1fr; }
+        #chart { height: 68vh; min-height: 420px; }
+      }
     </style>
   </head>
   <body>
-    <h2>TunaPred（2023年6-7月）活动范围与可捕获指数预测</h2>
-    <div class="controls">
-      <button onclick="fetchData()">1) 拉取数据</button>
-      <button onclick="trainModel()">2) 训练LightGBM</button>
-      <select id="species">
-        <option value="yellowfin">黄鳍金枪鱼</option>
-        <option value="skipjack">鲣鱼(跳鲣)</option>
-        <option value="albacore">长鳍金枪鱼</option>
-      </select>
-      <button onclick="loadPrediction()">3) 预测并可视化</button>
+    <div class="app">
+      <div class="topbar">
+        <div>
+          <h1 class="title">TunaPred Ocean Intelligence</h1>
+          <p class="subtitle">2023年6-7月 · 金枪鱼活动范围与可捕获指数预测系统</p>
+        </div>
+        <div id="api-badge" class="api-badge">API: Detecting...</div>
+      </div>
+
+      <div class="layout">
+        <aside class="panel left-panel">
+          <h3 class="panel-title">MISSION CONTROL</h3>
+          <div class="controls">
+            <button onclick="fetchData()">1) 拉取数据</button>
+            <button onclick="trainModel()">2) 训练 LightGBM</button>
+            <select id="species">
+              <option value="yellowfin">黄鳍金枪鱼</option>
+              <option value="skipjack">鲣鱼(跳鲣)</option>
+              <option value="albacore">长鳍金枪鱼</option>
+            </select>
+            <input id="predict-date" type="date" value="2025-06-01" />
+            <select id="predict-mode">
+              <option value="forecast_map">连续预报(0.25°全网格)</option>
+              <option value="legacy">兼容模式(Top点位)</option>
+            </select>
+            <button onclick="loadPrediction()">3) 预测并可视化</button>
+          </div>
+
+          <div id="status" class="status">系统待命：请先拉取数据。</div>
+          <div class="metrics">
+            <div class="metric">
+              <div class="metric-label">数据行数</div>
+              <div class="metric-value" id="m-rows">--</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">预测点位</div>
+              <div class="metric-value" id="m-points">--</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">MAE</div>
+              <div class="metric-value" id="m-mae">--</div>
+            </div>
+            <div class="metric">
+              <div class="metric-label">R²</div>
+              <div class="metric-value" id="m-r2">--</div>
+            </div>
+          </div>
+        </aside>
+
+        <section class="panel chart-panel">
+          <div id="chart"></div>
+        </section>
+      </div>
     </div>
-    <div id="status">等待操作...</div>
-    <div id="chart"></div>
 
     <script>
       const statusEl = document.getElementById('status');
+      const badgeEl = document.getElementById('api-badge');
+      const rowsEl = document.getElementById('m-rows');
+      const pointsEl = document.getElementById('m-points');
+      const maeEl = document.getElementById('m-mae');
+      const r2El = document.getElementById('m-r2');
+      const controlsEl = document.querySelector('.controls');
+      const API_BASE =
+        window.location.port === '8000'
+          ? ''
+          : `${window.location.protocol}//${window.location.hostname}:8000`;
+      const apiUrl = (path) => `${API_BASE}${path}`;
+      badgeEl.textContent = `API: ${API_BASE || window.location.origin}`;
+
+      const fmt = (v, digits = 3) =>
+        typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '--';
+
+      function setControlsBusy(isBusy) {
+        controlsEl.querySelectorAll('button, select, input').forEach((el) => {
+          el.disabled = isBusy;
+        });
+      }
 
       async function fetchData() {
-        statusEl.textContent = '正在拉取GBIF + Open-Meteo开源数据...';
-        const res = await fetch('/api/fetch', { method: 'POST' });
-        const data = await res.json();
-        statusEl.textContent = `数据完成：${data.rows}行, 时间 ${data.date_min} ~ ${data.date_max}`;
+        try {
+          setControlsBusy(true);
+          statusEl.textContent = '正在拉取 GBIF + Open-Meteo 开源数据...';
+          const res = await fetch(apiUrl('/api/fetch'), { method: 'POST' });
+          const data = await res.json();
+          rowsEl.textContent = data.rows ?? '--';
+          statusEl.textContent = `数据完成：${data.rows} 行，时间 ${data.date_min} ~ ${data.date_max}`;
+        } catch (e) {
+          statusEl.textContent = `数据拉取失败：${e.message}`;
+        } finally {
+          setControlsBusy(false);
+        }
       }
 
       async function trainModel() {
-        statusEl.textContent = '训练LightGBM(优先GPU，失败自动CPU)中...';
-        const res = await fetch('/api/train', { method: 'POST' });
-        const data = await res.json();
-        statusEl.textContent = `训练完成：MAE=${data.metrics.mae.toFixed(3)} R²=${data.metrics.r2.toFixed(3)}; 天气相关性=${JSON.stringify(data.weather_correlation)}`;
+        try {
+          setControlsBusy(true);
+          statusEl.textContent = '训练 LightGBM（优先 GPU，失败自动 CPU）...';
+          const res = await fetch(apiUrl('/api/train'), { method: 'POST' });
+          const data = await res.json();
+          maeEl.textContent = fmt(data.metrics?.mae);
+          r2El.textContent = fmt(data.metrics?.r2);
+          statusEl.textContent = `训练完成：MAE=${fmt(data.metrics?.mae)}，R²=${fmt(data.metrics?.r2)}。`;
+        } catch (e) {
+          statusEl.textContent = `模型训练失败：${e.message}`;
+        } finally {
+          setControlsBusy(false);
+        }
       }
 
       async function loadPrediction() {
-        const species = document.getElementById('species').value;
-        statusEl.textContent = `加载${species}预测结果...`;
-        const res = await fetch(`/api/predict?species=${species}`);
-        const data = await res.json();
-        const p = data.points;
+        try {
+          setControlsBusy(true);
+          const species = document.getElementById('species').value;
+          const predictDate = document.getElementById('predict-date').value || '2025-06-01';
+          const mode = document.getElementById('predict-mode').value;
+          const limit = mode === 'legacy' ? '5000' : '0';
+          statusEl.textContent = `加载 ${species} 在 ${predictDate} 的连续预测，模式=${mode} ...`;
+          const qs = new URLSearchParams({
+            species,
+            predict_date: predictDate,
+            mode,
+            region: 'china_seas',
+            resolution: '0.25',
+            limit,
+          });
+          const res = await fetch(apiUrl(`/api/predict?${qs.toString()}`));
+          const data = await res.json();
+          if (!res.ok) throw new Error(data.detail || `HTTP ${res.status}`);
+          const p = data.points;
+          pointsEl.textContent = p.length;
+          const bbox = data.meta?.bbox || { lon_min: 105, lon_max: 145, lat_min: 5, lat_max: 45 };
+          const lonMin = Number(bbox.lon_min ?? 105);
+          const lonMax = Number(bbox.lon_max ?? 145);
+          const latMin = Number(bbox.lat_min ?? 5);
+          const latMax = Number(bbox.lat_max ?? 45);
 
-        const trace = {
-          type: 'scattergeo',
-          mode: 'markers',
-          lat: p.map(x => x.grid_lat),
-          lon: p.map(x => x.grid_lon),
-          text: p.map(x => `日期:${x.event_date}<br>预测捕获指数:${x.predicted_catch_index.toFixed(2)}<br>可信度:${x.confidence.toFixed(2)}<br>SST:${x.sst}`),
-          marker: {
-            size: p.map(x => 8 + x.confidence * 15),
-            color: p.map(x => x.predicted_catch_index),
-            colorscale: 'Turbo',
-            colorbar: { title: 'Predicted Catch' },
-            opacity: 0.8,
+          let traces = [];
+          let layout = {
+            title: { text: `${data.species} 预测可捕获指数与可信度地图`, font: { color: '#d8f1ff', size: 18 } },
+            paper_bgcolor: '#071a3300',
+            plot_bgcolor: '#071a3300',
+            margin: { l: 20, r: 20, t: 52, b: 40 },
+            font: { color: '#d8f1ff' },
+          };
+
+          if (mode === 'forecast_map') {
+            // Render each 0.25° grid cell as a true raster-like cell.
+            const uniqueLons = [...new Set(p.map((x) => Number(x.grid_lon)))].sort((a, b) => a - b);
+            const uniqueLats = [...new Set(p.map((x) => Number(x.grid_lat)))].sort((a, b) => a - b);
+            const lonIndex = new Map(uniqueLons.map((v, i) => [v, i]));
+            const latIndex = new Map(uniqueLats.map((v, i) => [v, i]));
+            const z = Array.from({ length: uniqueLats.length }, () => Array(uniqueLons.length).fill(null));
+            const custom = Array.from({ length: uniqueLats.length }, () => Array(uniqueLons.length).fill(null));
+            for (const row of p) {
+              const r = latIndex.get(Number(row.grid_lat));
+              const c = lonIndex.get(Number(row.grid_lon));
+              if (r === undefined || c === undefined) continue;
+              z[r][c] = Number(row.predicted_catch_index);
+              custom[r][c] = {
+                confidence: Number(row.confidence),
+                sst: Number(row.sst),
+                date: row.event_date,
+              };
+            }
+
+            traces = [
+              {
+                type: 'heatmap',
+                x: uniqueLons,
+                y: uniqueLats,
+                z,
+                customdata: custom,
+                colorscale: 'Turbo',
+                zsmooth: false,
+                hoverongaps: false,
+                colorbar: { title: 'Catch Index', tickfont: { color: '#d8f1ff' } },
+                hovertemplate:
+                  'Lon: %{x:.2f}<br>Lat: %{y:.2f}<br>Catch: %{z:.2f}<br>Conf: %{customdata.confidence:.2f}<br>SST: %{customdata.sst:.2f}<br>Date: %{customdata.date}<extra></extra>',
+              },
+            ];
+
+            layout = {
+              ...layout,
+              xaxis: {
+                title: 'Longitude',
+                range: [lonMin, lonMax],
+                showgrid: true,
+                gridcolor: '#1d4e7a55',
+                zeroline: false,
+              },
+              yaxis: {
+                title: 'Latitude',
+                range: [latMin, latMax],
+                showgrid: true,
+                gridcolor: '#1d4e7a55',
+                zeroline: false,
+                scaleanchor: 'x',
+                scaleratio: 1,
+              },
+            };
+          } else {
+            traces = [
+              {
+                type: 'scattergeo',
+                mode: 'markers',
+                lat: p.map((x) => x.grid_lat),
+                lon: p.map((x) => x.grid_lon),
+                text: p.map((x) => `日期:${x.event_date}<br>预测捕获指数:${x.predicted_catch_index.toFixed(2)}<br>可信度:${x.confidence.toFixed(2)}<br>SST:${x.sst}`),
+                marker: {
+                  size: p.map((x) => 7 + x.confidence * 16),
+                  color: p.map((x) => x.predicted_catch_index),
+                  colorscale: 'Turbo',
+                  colorbar: { title: 'Catch Index', tickfont: { color: '#d8f1ff' } },
+                  line: { color: '#8be8ff', width: 0.6 },
+                  opacity: 0.86,
+                },
+              },
+            ];
+            layout = {
+              ...layout,
+              geo: {
+                projection: { type: 'natural earth' },
+                bgcolor: '#06172e',
+                showland: true,
+                landcolor: '#19334b',
+                showocean: true,
+                oceancolor: '#08223e',
+                showcoastlines: true,
+                coastlinecolor: '#56c8ff',
+                countrycolor: '#2e5f8f',
+                lonaxis: { range: [lonMin, lonMax] },
+                lataxis: { range: [latMin, latMax] },
+              },
+            };
           }
-        };
 
-        const layout = {
-          title: `${data.species} 预测可捕获指数与可信度地图`,
-          geo: { projection: { type: 'natural earth' }, showland: true, landcolor: '#f3f3f3' },
-        };
-        Plotly.newPlot('chart', [trace], layout, { responsive: true });
-        statusEl.textContent = `展示完成，共${p.length}个网格点。`;
+          Plotly.newPlot('chart', traces, layout, { responsive: true, displayModeBar: false });
+          const provider = data.meta?.source_health || data.meta?.provider_status || {};
+          const partial = provider.partial_results ? '部分结果(超时保护触发)' : '完整结果';
+          statusEl.textContent = `展示完成：${partial}，返回 ${data.meta?.returned_points}/${data.meta?.row_count} 点；NOAA:${fmt(provider.noaa_ok_ratio, 2)} HYCOM:${fmt(provider.hycom_ok_ratio, 2)} 缓存:${data.meta?.cache_hit ? '命中' : '未命中'}`;
+        } catch (e) {
+          statusEl.textContent = `预测加载失败：${e.message}`;
+        } finally {
+          setControlsBusy(false);
+        }
       }
     </script>
   </body>
